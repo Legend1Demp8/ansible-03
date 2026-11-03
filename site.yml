@@ -1,0 +1,217 @@
+---
+# ====================================================================
+# PLAY 1: Установка ClickHouse (Выполняется только на clickhouse-01)
+# ====================================================================
+- name: Install ClickHouse
+  hosts: clickhouse
+  become: true
+  tasks:
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Add ClickHouse GPG key
+      ansible.builtin.apt_key:
+        url: https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key
+        state: present
+        keyring: /usr/share/keyrings/clickhouse-keyring.gpg
+
+    - name: Add ClickHouse repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg arch=amd64] https://packages.clickhouse.com/deb stable main"
+        filename: clickhouse
+        state: present
+        update_cache: true
+
+    - name: Install ClickHouse packages
+      ansible.builtin.apt:
+        name: "{{ clickhouse_packages | map('regex_replace', '$', '=' + clickhouse_version) | list }}"
+        state: present
+      when: not ansible_check_mode
+
+    - name: Ensure ClickHouse service is started and enabled
+      ansible.builtin.service:
+        name: clickhouse-server
+        state: started
+        enabled: true
+      when: not ansible_check_mode
+# ====================================================================
+# PLAY 2: Установка Vector (Выполняется только на vector)
+# ====================================================================
+- name: Install and configure Vector
+  hosts: vector
+  become: true
+  tasks:
+    - name: Create vector group
+      ansible.builtin.group:
+        name: vector
+        system: true
+
+    - name: Create vector user
+      ansible.builtin.user:
+        name: vector
+        group: vector
+        groups: systemd-journal
+        append: true
+        system: true
+
+    - name: Create vector directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: vector
+        group: vector
+        mode: '0755'
+      loop:
+        - "{{ vector_install_dir }}"
+        - "{{ vector_data_dir }}"
+        - "{{ vector_config_dir }}"
+
+    - name: Download Vector archive
+      ansible.builtin.get_url:
+        url: "{{ vector_archive_url }}"
+        dest: "/tmp/vector-{{ vector_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Unarchive Vector
+      ansible.builtin.unarchive:
+        src: "/tmp/vector-{{ vector_version }}.tar.gz"
+        dest: "{{ vector_install_dir }}"
+        remote_src: true
+        extra_opts: ["--strip-components=2"]
+        owner: vector
+        group: vector
+        creates: "{{ vector_install_dir }}/bin/vector"
+
+    - name: Create symlink for vector binary
+      ansible.builtin.file:
+        src: "{{ vector_install_dir }}/bin/vector"
+        dest: "/usr/local/bin/vector"
+        state: link
+
+    - name: Deploy Vector configuration from template
+      ansible.builtin.template:
+        src: "vector.toml.j2"
+        dest: "{{ vector_config_file }}"
+        owner: vector
+        group: vector
+        mode: '0644'
+      notify: Restart Vector
+
+    - name: Install systemd unit for Vector
+      ansible.builtin.template:
+        src: "vector.service.j2"
+        dest: "/etc/systemd/system/vector.service"
+        mode: '0644'
+      notify: Reload systemd
+
+    - name: Ensure Vector service is enabled and started
+      ansible.builtin.systemd:
+        name: vector
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+      notify: Restart Vector
+
+    - name: Restart Vector
+      ansible.builtin.systemd:
+        name: vector
+        state: restarted
+# ====================================================================
+# PLAY 3: Установка LightHouse (Выполняется только на lighthouse)
+# ====================================================================
+- name: Install and configure LightHouse
+  hosts: lighthouse
+  become: true
+  tasks:
+    - name: Install Nginx and Git
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - git
+        state: present
+        update_cache: true
+      tags: nginx
+
+    - name: Check if LightHouse is already cloned
+      ansible.builtin.stat:
+        path: "{{ lighthouse_dir }}/.git"
+      register: lighthouse_git
+      tags: lighthouse
+
+    - name: Clone LightHouse repository
+      ansible.builtin.git:
+        repo: "https://github.com/VKCOM/lighthouse.git"
+        dest: "{{ lighthouse_dir }}"
+        version: master
+        force: true
+      when: not lighthouse_git.stat.exists
+      tags: lighthouse
+
+    - name: Update LightHouse repository (only if lighthouse_force_update=true)
+      ansible.builtin.git:
+        repo: "https://github.com/VKCOM/lighthouse.git"
+        dest: "{{ lighthouse_dir }}"
+        version: master
+        force: true
+        update: true
+      when:
+        - lighthouse_git.stat.exists
+        - lighthouse_force_update | bool
+      tags: lighthouse
+
+    - name: Set ownership of lighthouse_dir to www-data
+      ansible.builtin.file:
+        path: "{{ lighthouse_dir }}"
+        state: directory
+        recurse: true
+        owner: www-data
+        group: www-data
+        mode: '0755'
+      tags: lighthouse
+
+    - name: Configure Nginx site for LightHouse
+      ansible.builtin.template:
+        src: "lighthouse.conf.j2"
+        dest: "/etc/nginx/sites-available/lighthouse"
+        mode: '0644'
+      notify: Restart Nginx
+      tags: nginx
+
+    - name: Enable LightHouse Nginx site
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/lighthouse"
+        dest: "/etc/nginx/sites-enabled/lighthouse"
+        state: link
+      notify: Restart Nginx
+      tags: nginx
+
+    - name: Remove default Nginx site configuration
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-enabled/default"
+        state: absent
+      notify: Restart Nginx
+      tags: nginx
+
+    - name: Ensure Nginx service is running and enabled
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+      tags: nginx
+
+  handlers:
+    - name: Restart Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted

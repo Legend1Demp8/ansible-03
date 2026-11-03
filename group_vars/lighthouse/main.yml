@@ -1,0 +1,4 @@
+---
+lighthouse_dir: /usr/share/nginx/lighthouse
+lighthouse_port: 80
+lighthouse_force_update: false
